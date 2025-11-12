@@ -1,0 +1,6 @@
+# Local secrets and private keys
+.env
+*.pem
+__pycache__/
+.venv/
+check_key.py
