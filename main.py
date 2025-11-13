@@ -19,7 +19,7 @@ def cents_to_dollars(cents: int) -> str:
     return f"${(cents or 0) / 100:,.2f}"
 
 def ts_to_iso(ts_seconds: int) -> str:
-    return dt.datetime.utcfromtimestamp(ts_seconds or 0).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return dt.datetime.fromtimestamp(ts_seconds or 0).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 # ---------- classification & styling ----------
 SPORT_KEYS = ("NBA","NFL","MLB","NHL","EPL","NCAAMB","NCAAF","ATP","WTA","NCAAMBGAME","GAME","MATCH")
