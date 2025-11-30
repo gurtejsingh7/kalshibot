@@ -20,7 +20,7 @@ def _getenv_required(name: str) -> str:
 # ---- Load required environment variables ----
 API_KEY_ID: str = _getenv_required("KALSHI_API_KEY_ID")
 PRIVATE_KEY_PATH: str = _getenv_required("KALSHI_PRIVATE_KEY_PATH")
-BASE_URL: str = os.getenv("KALSHI_BASE_URL", "https://demo-api.kalshi.co/trade-api/v2").rstrip("/")
+BASE_URL: str = os.getenv("KALSHI_BASE_URL", "https://demo-api.kalshi.co").rstrip("/")
 
 
 # ---- Sanity checks ----

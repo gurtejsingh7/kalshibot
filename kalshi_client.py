@@ -2,147 +2,267 @@ import time
 import json
 import base64
 import requests
-from typing import Optional, Dict, Any, Iterable
+from typing import Optional, Dict, Any, Iterable, List
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
+import logging
 
+logger = logging.getLogger("kalshi")
+logger.setLevel(logging.INFO)
+
+
+# Kalshi trade API base path (used in signing and URLs)
 API_BASE_PATH = "/trade-api/v2"
+
 
 class KalshiClient:
     def __init__(self, api_key_id: str, private_key_path: str, base_url: str):
+
         self.api_key_id = api_key_id
-        self.private_key_path = private_key_path
         self.base_url = base_url.rstrip("/")
-        self.private_key = self._load_private_key_from_file()
-        self.session = requests.Session()
+        self.private_key = self._load_private_key(private_key_path)
 
-    # ---------- internals ----------
-    def _load_private_key_from_file(self):
-        with open(self.private_key_path, "rb") as key_file:
-            return serialization.load_pem_private_key(key_file.read(), password=None)
+    # ---------- key loading & signing ----------
 
-    def _ts_ms(self) -> str:
-        return str(int(time.time_ns() // 1_000_000))
+    @staticmethod
+    def _load_private_key(path: str):
+        with open(path, "rb") as f:
+            data = f.read()
+        return serialization.load_pem_private_key(data, password=None)
 
-    def _sign_pss(self, timestamp_ms: str, method: str, path_with_query: str) -> str:
-        # sign full API path, strip query
-        if path_with_query.startswith(API_BASE_PATH):
-            signed_path = path_with_query.split("?", 1)[0]
-        else:
-            signed_path = (API_BASE_PATH + path_with_query).split("?", 1)[0]
-        text = timestamp_ms + method + signed_path
-        sig = self.private_key.sign(
-            text.encode("utf-8"),
-            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+    def _create_signature(self, timestamp_ms: str, method: str, path: str) -> str:
+
+        full_path = f"{API_BASE_PATH}{path}"
+        path_without_query = full_path.split("?", 1)[0]
+
+        message = f"{timestamp_ms}{method}{path_without_query}".encode("utf-8")
+
+        signature = self.private_key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
             hashes.SHA256(),
         )
-        return base64.b64encode(sig).decode("utf-8")
+        return base64.b64encode(signature).decode("utf-8")
 
-    def _headers(self, ts_ms: str, signature_b64: str) -> Dict[str, str]:
-        return {
+    def _build_query(self, params: Dict[str, Any]) -> str:
+
+        parts: List[str] = []
+        for k, v in params.items():
+            if v is None or v == "":
+                continue
+            parts.append(f"{k}={v}")
+        return "&".join(parts)
+
+    def _build_url(self, path: str) -> str:
+       
+        if self.base_url.endswith(API_BASE_PATH):
+            return f"{self.base_url}{path}"
+        return f"{self.base_url}{API_BASE_PATH}{path}"
+
+    # ---------- core request ----------
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        
+        # ---------- Core authenticated request helper ----------
+        method = method.upper()
+        ts_ms = str(int(time.time() * 1000))
+
+        signature = self._create_signature(ts_ms, method, path)
+
+        headers = {
             "KALSHI-ACCESS-KEY": self.api_key_id,
-            "KALSHI-ACCESS-TIMESTAMP": ts_ms,      # milliseconds
-            "KALSHI-ACCESS-SIGNATURE": signature_b64,
+            "KALSHI-ACCESS-TIMESTAMP": ts_ms,
+            "KALSHI-ACCESS-SIGNATURE": signature,
             "Content-Type": "application/json",
         }
 
-    def _url(self, path: str) -> str:
-        if self.base_url.endswith(API_BASE_PATH):
-            return self.base_url + (path if path.startswith("/") else "/" + path)
-        if path.startswith(API_BASE_PATH):
-            return self.base_url + path
-        return self.base_url + API_BASE_PATH + (path if path.startswith("/") else "/" + path)
+        url = self._build_url(path)
 
-    def _request_once(self, method: str, path: str, data: Optional[dict]) -> Optional[requests.Response]:
-        ts_ms = self._ts_ms()
-        sig = self._sign_pss(ts_ms, method, path)
-        headers = self._headers(ts_ms, sig)
-        url = self._url(path)
-        body = None if (method == "GET" or data is None) else json.dumps(data).encode("utf-8")
         try:
             if method == "GET":
-                return self.session.get(url, headers=headers)
-            if method == "POST":
-                return self.session.post(url, headers=headers, data=body)
-            raise ValueError(f"Unsupported method: {method}")
-        except requests.RequestException:
+                resp = requests.get(url, headers=headers, timeout=10)
+            elif method in ("POST", "PUT", "PATCH"):
+                resp = requests.request(
+                    method, url, headers=headers, data=json.dumps(data or {}), timeout=10
+                )
+            elif method == "DELETE":
+                if data:
+                    resp = requests.delete(
+                        url, headers=headers, data=json.dumps(data), timeout=10
+                    )
+                else:
+                    resp = requests.delete(url, headers=headers, timeout=10)
+            else:
+                raise ValueError(f"Unsupported HTTP method: {method}")
+        except requests.RequestException as e:
+            print(f"Request error: {e}")
             return None
 
-    # ---------- robust request (rate limits, retries) ----------
-    def request(self, method: str, path: str, data: Optional[dict] = None) -> Optional[dict]:
-        max_retries = 5
-        base_sleep = 0.25
-        for attempt in range(max_retries):
-            resp = self._request_once(method, path, data)
-            if resp is None:
-                time.sleep(base_sleep * (2 ** attempt))
-                continue
-            if resp.status_code == 401:
-                # bad signature/creds; do not retry
-                try:
-                    resp.raise_for_status()
-                except requests.HTTPError:
-                    pass
-                return None
-            if resp.status_code in (429, 500, 502, 503, 504):
-                # rate-limit/backoff
-                ra = resp.headers.get("Retry-After")
-                if ra:
-                    try:
-                        time.sleep(float(ra))
-                    except ValueError:
-                        time.sleep(base_sleep * (2 ** attempt))
-                else:
-                    time.sleep(base_sleep * (2 ** attempt))
-                continue
-            try:
-                resp.raise_for_status()
-                return resp.json()
-            except requests.HTTPError:
-                # non-retryable error
-                return None
-        return None
+            if not (200 <= resp.status_code < 300):
+                logger.error(
+                 f"[HTTP ERROR] {method} {path} | Status {resp.status_code} | Response: {resp.text}"
+    )
+            return None
 
-    # ---------- pagination ----------
-    def paginate(self, path: str, *, limit: int = 100, params: Dict[str, Any] | None = None, key: str = "") -> Iterable[Any]:
-        """
-        Cursor-based pagination. If key provided, yields each item under response[key].
-        Otherwise yields each page dict.
-        """
-        params = dict(params or {})
-        params["limit"] = limit
-        cursor = None
+        try:
+            return resp.json()
+        except json.JSONDecodeError:
+            print("Warning: response was not valid JSON")
+            return None
+
+    # ---------- pagination helper ----------
+
+    def kalpaginate(
+        self,
+        base_path: str,
+        limit: int,
+        params: Optional[Dict[str, Any]],
+        key: str,
+    ) -> Iterable[Dict[str, Any]]:
+        
+    # ---------- Generic cursor-based pagination helper ----------
+        
+        cursor: Optional[str] = None
+
         while True:
-            qs = "&".join([f"{k}={params[k]}" for k in params if params[k] is not None])
-            url_path = f"{path}?{qs}" if qs else path
+            q: Dict[str, Any] = dict(params or {})
+            q["limit"] = limit
             if cursor:
-                url_path += f"&cursor={cursor}"
-            data = self.request("GET", url_path)
-            if not data:
-                return
-            if key:
-                for item in data.get(key, []):
-                    yield item
-            else:
-                yield data
-            cursor = data.get("cursor")
+                q["cursor"] = cursor
+
+            qs = self._build_query(q)
+            path = base_path if not qs else f"{base_path}?{qs}"
+
+            resp = self.request("GET", path)
+            if not resp:
+                break
+
+            items = resp.get(key, [])
+            for item in items:
+                yield item
+
+            cursor = resp.get("cursor")
             if not cursor:
                 break
 
-    # ---------- convenience ----------
+    # ---------- basic high-level helpers ----------
+
     def get_balance(self) -> Optional[Dict[str, Any]]:
         return self.request("GET", "/portfolio/balance")
 
-    def list_markets(self, *, status: str = "open", limit: int = 10) -> Optional[Dict[str, Any]]:
-        # standard single-page helper
-        path_no_query = "/markets"
-        url_path_with_query = f"{path_no_query}?status={status}&limit={limit}"
-        return self.request("GET", url_path_with_query)
+    def list_markets(
+        self,
+        status: str = "open",
+        limit: int = 15,
+    ) -> Optional[Dict[str, Any]]:
+        params = {"status": status, "limit": limit}
+        qs = self._build_query(params)
+        path = "/markets" if not qs else f"/markets?{qs}"
+        return self.request("GET", path)
 
-    def place_order(self, *, ticker: str, side: str, quantity: int, yes_price: Optional[int] = None, no_price: Optional[int] = None) -> Optional[Dict[str, Any]]:
-        order = {"ticker": ticker, "side": side, "quantity": quantity}
+    def place_order(
+        self,
+        ticker: str,
+        side: str, #yes/no
+        action: str, #buy/sell
+        quantity: int,
+        yes_price: Optional[int] = None,
+        no_price: Optional[int] = None,
+        order_type: str = "limit",
+       # time_in_force: str = "gtc",
+    ) -> Optional[Dict[str, Any]]:
+        body: Dict[str, Any] = {
+            "ticker": ticker,
+            "action": action,
+            "type": order_type,
+           # "time_in_force": time_in_force,
+            "side": side,
+            "count": quantity,
+        }
         if yes_price is not None:
-            order["yes_price"] = yes_price
+            body["yes_price"] = yes_price
         if no_price is not None:
-            order["no_price"] = no_price
-        return self.request("POST", "/orders", data=order)
+            body["no_price"] = no_price
+
+        return self.request("POST", "/portfolio/orders", data=body)
+
+    # ---------- portfolio: positions & orders ----------
+
+    def get_positions(
+        self,
+        settlement_status: str = "unsettled",
+        count_filter: str = "position",
+        ticker: Optional[str] = None,
+        event_ticker: Optional[str] = None,
+        limit: int = 100,
+        cursor: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        params: Dict[str, Any] = {
+            "limit": limit,
+            "settlement_status": settlement_status,
+            "count_filter": count_filter,
+        }
+        if ticker:
+            params["ticker"] = ticker
+        if event_ticker:
+            params["event_ticker"] = event_ticker
+        if cursor:
+            params["cursor"] = cursor
+
+        qs = self._build_query(params)
+        path = "/portfolio/positions" if not qs else f"/portfolio/positions?{qs}"
+        return self.request("GET", path)
+
+    def get_orders(
+        self,
+        status: str = "resting",
+        ticker: Optional[str] = None,
+        limit: int = 100,
+        cursor: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+       
+        params: Dict[str, Any] = {
+            "limit": limit,
+        }
+        if status and status != "all":
+            params["status"] = status
+        if ticker:
+            params["ticker"] = ticker
+        if cursor:
+            params["cursor"] = cursor
+
+        qs = self._build_query(params)
+        path = "/portfolio/orders" if not qs else f"/portfolio/orders?{qs}"
+        return self.request("GET", path)
+
+    def cancel_order(self, order_id: str) -> Optional[Dict[str, Any]]:
+        return self.request("DELETE", f"/portfolio/orders/{order_id}")
+
+    def cancel_all_for_ticker(
+        self,
+        ticker: str,
+        status: str = "resting",
+        limit: int = 1000,
+    ) -> Optional[List[Dict[str, Any]]]:
+        
+        resp = self.get_orders(status=status, ticker=ticker, limit=limit)
+        if not resp or "orders" not in resp:
+            return None
+
+        results: List[Dict[str, Any]] = []
+        for order in resp["orders"]:
+            oid = order.get("order_id")
+            if not oid:
+                continue
+            cancelled = self.cancel_order(oid)
+            if cancelled is not None:
+                results.append(cancelled)
+        return results
